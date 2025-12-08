@@ -1,103 +1,100 @@
+# src/data_loader.py
 import torch
-import spacy
-from collections import Counter
+import io
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
+from torchtext.data.utils import get_tokenizer
+from torchtext.vocab import build_vocab_from_iterator
 
-# --- 1. Cấu hình Token & Spacy ---
-# Load mô hình ngôn ngữ Spacy (đã tải ở bước trước)
-spacy_en = spacy.load("en_core_web_sm")
-spacy_fr = spacy.load("fr_core_news_sm")
-
-def tokenize_en(text):
-    """Tách từ tiếng Anh: "Hello world." -> ["Hello", "world", "."]"""
-    return [tok.text for tok in spacy_en.tokenizer(text)]
-
-def tokenize_fr(text):
-    """Tách từ tiếng Pháp"""
-    return [tok.text for tok in spacy_fr.tokenizer(text)]
-
-# Các chỉ số đặc biệt
-UNK_IDX, PAD_IDX, SOS_IDX, EOS_IDX = 0, 1, 2, 3
-SPECIAL_SYMBOLS = ['<unk>', '<pad>', '<sos>', '<eos>']
-
-# --- 2. Class Tự Xây Dựng Từ Điển (Thay thế Torchtext) ---
-class Vocab:
-    def __init__(self, counter, min_freq=2):
-        # Khởi tạo map: Token -> ID (bắt đầu bằng các token đặc biệt)
-        self.stoi = {tok: i for i, tok in enumerate(SPECIAL_SYMBOLS)}
-        self.itos = {i: tok for i, tok in enumerate(SPECIAL_SYMBOLS)}
-        idx = len(SPECIAL_SYMBOLS)
-        
-        # Duyệt qua các từ đếm được, nếu xuất hiện đủ nhiều thì thêm vào từ điển
-        for word, count in counter.items():
-            if count >= min_freq:
-                self.stoi[word] = idx
-                self.itos[idx] = word
-                idx += 1
+# Khai báo các hằng số
+PAD_TOKEN = '<pad>'
+SOS_TOKEN = '<sos>'
+EOS_TOKEN = '<eos>'
+UNK_TOKEN = '<unk>'
+#tokenization
+def get_tokenizers():
+    try:
+        en_tokenizer = get_tokenizer('spacy', language='en_core_web_sm')
+        fr_tokenizer = get_tokenizer('spacy', language='fr_core_news_sm')
+        return en_tokenizer, fr_tokenizer
+    except OSError:
+        print("Lỗi get_tokenizers")
+        return None, None
+#xây dựng từ điển (Vocabulary)
+def build_vocabulary(filepath, tokenizer):
+    def yield_tokens(file_path):
+        with io.open(file_path, encoding='utf-8') as f:
+            for line in f:
+                yield tokenizer(line.strip())
                 
-    def __len__(self):
-        return len(self.stoi)
+    special_tokens = [UNK_TOKEN, PAD_TOKEN, SOS_TOKEN, EOS_TOKEN]
+    vocab = build_vocab_from_iterator(
+        yield_tokens(filepath),
+        specials=special_tokens,
+        max_tokens=10000
+    )
+    vocab.set_default_index(vocab[UNK_TOKEN])
+    return vocab
+
+def text_transform(tokenizer, vocab, text):
+    token_list = tokenizer(text.strip())
+    sos_idx = vocab[SOS_TOKEN]
+    eos_idx = vocab[EOS_TOKEN]
+    index_list = [vocab[token] for token in token_list]
+    return torch.tensor([sos_idx] + index_list + [eos_idx])
+
+# Hàm tạo Collate_fn với biến vocab được truyền vào (Closure)
+def create_collate_fn(en_tokenizer, fr_tokenizer, vocab_en, vocab_fr):
+    pad_idx = vocab_en[PAD_TOKEN]
+    
+    def collate_batch(batch):
+        src_batch, trg_batch = [], []
+        src_lens = []
         
-    def __getitem__(self, token):
-        # Lấy ID của token, nếu không có trả về UNK_IDX
-        return self.stoi.get(token, UNK_IDX)
-
-def build_vocab_manual(filepath, tokenizer):
-    """Đọc file text và đếm tần suất từ"""
-    counter = Counter()
-    print(f"📖 Đang quét từ vựng file: {filepath}...")
-    with open(filepath, 'r', encoding='utf-8') as f:
-        for line in f:
-            tokens = tokenizer(line.strip())
-            counter.update(tokens)
-    return Vocab(counter, min_freq=2)
-
-# --- 3. Dataset & Transform ---
-class EnFrDataset(Dataset):
-    def __init__(self, src_path, trg_path, src_vocab, trg_vocab, src_tokenizer, trg_tokenizer):
-        self.data = []
-        print(f"loading data {src_path}...")
-        with open(src_path, 'r', encoding='utf-8') as f_src, open(trg_path, 'r', encoding='utf-8') as f_trg:
-            for line_src, line_trg in zip(f_src, f_trg):
-                # Tokenize và chuyển sang ID ngay lúc load để code gọn
-                src_tokens = [SOS_IDX] + [src_vocab[t] for t in src_tokenizer(line_src.strip())] + [EOS_IDX]
-                trg_tokens = [SOS_IDX] + [trg_vocab[t] for t in trg_tokenizer(line_trg.strip())] + [EOS_IDX]
-                self.data.append((torch.tensor(src_tokens), torch.tensor(trg_tokens)))
-                
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return self.data[idx]
-
-def collate_fn(batch):
-    src_batch, trg_batch = [], []
-    for src_item, trg_item in batch:
-        src_batch.append(src_item)
-        trg_batch.append(trg_item)
+        for src_sample, trg_sample in batch:
+            src_item = text_transform(en_tokenizer, vocab_en, src_sample)
+            trg_item = text_transform(fr_tokenizer, vocab_fr, trg_sample)
+            src_batch.append(src_item)
+            trg_batch.append(trg_item)
+            src_lens.append(len(src_item))
+            
+        # Sorting for packing
+        zipped = list(zip(src_batch, trg_batch, src_lens))
+        zipped.sort(key=lambda x: x[2], reverse=True)
+        src_batch, trg_batch, src_lens = zip(*zipped)
+        
+        src_batch = pad_sequence(src_batch, padding_value=pad_idx)
+        trg_batch = pad_sequence(trg_batch, padding_value=pad_idx)
+        
+        return src_batch, trg_batch, torch.tensor(src_lens)
+        
+    return collate_batch
+#data loader
+def get_loaders(batch_size, path_en, path_fr):
+    # 1. Tokenizers
+    en_tokenizer, fr_tokenizer = get_tokenizers()
     
-    # Padding
-    src_batch = pad_sequence(src_batch, padding_value=PAD_IDX)
-    trg_batch = pad_sequence(trg_batch, padding_value=PAD_IDX)
-    return src_batch, trg_batch
-
-# --- 4. Hàm Main gọi từ bên ngoài ---
-def create_dataset_and_loaders(batch_size=128):
-    # Bước 1: Xây dựng từ điển thủ công
-    en_vocab = build_vocab_manual('data/raw/train.en', tokenize_en)
-    fr_vocab = build_vocab_manual('data/raw/train.fr', tokenize_fr)
+    # 2. Vocab
+    print("⏳ Building Vocab...")
+    vocab_en = build_vocabulary(path_en, en_tokenizer)
+    vocab_fr = build_vocabulary(path_fr, fr_tokenizer)
     
-    print(f"✅ Đã xây xong Vocab! Anh: {len(en_vocab)}, Pháp: {len(fr_vocab)}")
-
-    # Bước 2: Tạo Dataset
-    train_ds = EnFrDataset('data/raw/train.en', 'data/raw/train.fr', en_vocab, fr_vocab, tokenize_en, tokenize_fr)
-    val_ds = EnFrDataset('data/raw/val.en', 'data/raw/val.fr', en_vocab, fr_vocab, tokenize_en, tokenize_fr)
-    test_ds = EnFrDataset('data/raw/test.en', 'data/raw/test.fr', en_vocab, fr_vocab, tokenize_en, tokenize_fr)
-
-    # Bước 3: DataLoader
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-
-    return train_loader, val_loader, test_loader, en_vocab, fr_vocab
+    # 3. Data Loading
+    def read_raw_data(p_en, p_fr):
+        with open(p_en, encoding='utf-8') as f_en, open(p_fr, encoding='utf-8') as f_fr:
+            return list(zip(f_en, f_fr))
+            
+    train_data = read_raw_data(path_en, path_fr)
+    
+    # 4. Collate function
+    collate_fn = create_collate_fn(en_tokenizer, fr_tokenizer, vocab_en, vocab_fr)
+    
+    # 5. DataLoader
+    train_loader = DataLoader(
+        train_data, 
+        batch_size=batch_size, 
+        collate_fn=collate_fn, 
+        shuffle=True
+    )
+    
+    return train_loader, vocab_en, vocab_fr
