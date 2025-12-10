@@ -7,7 +7,7 @@ class Encoder(nn.Module):
     def __init__(self, input_dim, emb_dim, hid_dim, n_layers, dropout):
         super().__init__()
         self.hid_dim = hid_dim
-        self.n_layers = n_layers
+        self.n_layers = n_layers 
         self.embedding = nn.Embedding(input_dim, emb_dim)
         self.dropout = nn.Dropout(dropout)
         self.rnn = nn.LSTM(emb_dim, hid_dim, n_layers, dropout=dropout)
@@ -30,6 +30,7 @@ class Decoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, input, hidden, cell):
+        
         input = input.unsqueeze(0)
         embedded = self.dropout(self.embedding(input))
         output, (hidden, cell) = self.rnn(embedded, (hidden, cell))
@@ -42,18 +43,18 @@ class Seq2Seq(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.device = device
-        assert encoder.hid_dim == decoder.hid_dim, "Hidden dimensions must match!"
-        assert encoder.n_layers == decoder.n_layers, "Layers must match!"
+        assert encoder.hid_dim == decoder.hid_dim,\
+            "Kích thước Hidden State của Encoder và Decoder không khớp!"
+        assert encoder.n_layers == decoder.n_layers, \
+            "Số lượng layer của Encoder và Decoder không khớp!"
         
     def forward(self, src, trg, src_len, teacher_forcing_ratio=0.5):
         batch_size = src.shape[1]
         trg_len = trg.shape[0]
         trg_vocab_size = self.decoder.output_dim
-        
         outputs = torch.zeros(trg_len, batch_size, trg_vocab_size).to(self.device)
         hidden, cell = self.encoder(src, src_len)
         input = trg[0, :]
-        
         for t in range(1, trg_len):
             output, hidden, cell = self.decoder(input, hidden, cell)
             outputs[t] = output
